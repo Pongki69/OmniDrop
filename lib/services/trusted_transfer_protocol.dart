@@ -557,6 +557,7 @@ class IncomingTransferProgress {
     required this.totalBytes,
     required this.complete,
     this.failed = false,
+    this.isDirect = false,
   });
 
   final String transferId;
@@ -567,6 +568,7 @@ class IncomingTransferProgress {
   final int totalBytes;
   final bool complete;
   final bool failed;
+  final bool isDirect;
 }
 
 class TransferSocketReader {

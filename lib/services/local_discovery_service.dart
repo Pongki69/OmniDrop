@@ -547,6 +547,10 @@ class LocalDiscoveryService {
         isTransfer = true;
         final transferId =
             '${DateTime.now().microsecondsSinceEpoch}-${Random.secure().nextInt(1 << 32)}';
+        final senderId = payload['device_id'] as String?;
+        final directPeer = senderId == null ? null : _directPeersById[senderId];
+        final incomingIsDirect = directPeer != null &&
+            directPeer.address == socket.remoteAddress.address;
         activeTransferId = transferId;
         _incomingTransferSockets[transferId] = socket;
         await TrustedTransferProtocol.serve(
@@ -588,6 +592,7 @@ class LocalDiscoveryService {
                 bytesReceived: received,
                 totalBytes: file.size,
                 complete: complete,
+                isDirect: incomingIsDirect,
               );
               _transferProgress.add(latestProgress!);
             }
@@ -633,6 +638,7 @@ class LocalDiscoveryService {
           totalBytes: progress.totalBytes,
           complete: false,
           failed: true,
+          isDirect: progress.isDirect,
         ));
       }
       if ((isTransfer && !cancelledLocally) || isChat) {

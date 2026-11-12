@@ -24,6 +24,8 @@ import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : FlutterActivity() {
     private var startupPermissionResult: MethodChannel.Result? = null
+    private var pendingStoragePickerResult: MethodChannel.Result? = null
+    private val storagePickerRequest = 9215
     private var wifiP2pManager: WifiP2pManager? = null
     private var wifiP2pChannel: WifiP2pManager.Channel? = null
 
@@ -55,6 +57,108 @@ class MainActivity : FlutterActivity() {
                     getSharedPreferences("omnidrop_runtime", MODE_PRIVATE)
                         .edit().putBoolean("visible", visible).apply()
                     result.success(null)
+                    return@setMethodCallHandler
+                }
+                if (call.method == "updateTransferNotification") {
+                    val active = call.argument<Boolean>("active") ?: true
+                    val title = call.argument<String>("title") ?: "OmniDrop transfer"
+                    val text = call.argument<String>("text") ?: "Transferring files"
+                    val progress = call.argument<Int>("progress") ?: -1
+                    getSharedPreferences("omnidrop_runtime", MODE_PRIVATE).edit()
+                        .putBoolean("transfer_notification_active", active)
+                        .putString("transfer_notification_title", title)
+                        .putString("transfer_notification_text", text)
+                        .putInt("transfer_notification_progress", progress)
+                        .apply()
+                    val intent = Intent(this, OmniDropBackgroundService::class.java)
+                        .putExtra(OmniDropBackgroundService.EXTRA_ACTIVE, active)
+                        .putExtra(OmniDropBackgroundService.EXTRA_TITLE, title)
+                        .putExtra(OmniDropBackgroundService.EXTRA_TEXT, text)
+                        .putExtra(OmniDropBackgroundService.EXTRA_PROGRESS, progress)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+                    else startService(intent)
+                    result.success(null)
+                    return@setMethodCallHandler
+                }
+                if (call.method == "pickStorageDirectory") {
+                    if (pendingStoragePickerResult != null) {
+                        result.error("PICKER_BUSY", "A storage picker is already open.", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        pendingStoragePickerResult = result
+                        val picker = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                        }
+                        startActivityForResult(picker, storagePickerRequest)
+                    } catch (error: Exception) {
+                        pendingStoragePickerResult = null
+                        result.error("PICKER_FAILED", error.message ?: "Could not open storage picker.", null)
+                    }
+                    return@setMethodCallHandler
+                }
+                if (call.method == "listStorageDirectory") {
+                    try {
+                        val treeUri = android.net.Uri.parse(call.argument<String>("treeUri")
+                            ?: throw IllegalArgumentException("Storage folder is missing."))
+                        val documentId = call.argument<String>("documentId")
+                            ?: android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+                        val childrenUri = android.provider.DocumentsContract
+                            .buildChildDocumentsUriUsingTree(treeUri, documentId)
+                        val columns = arrayOf(
+                            android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                            android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                            android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE,
+                            android.provider.DocumentsContract.Document.COLUMN_SIZE,
+                            android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+                        )
+                        val entries = mutableListOf<Map<String, Any?>>()
+                        contentResolver.query(childrenUri, columns, null, null, null)?.use { cursor ->
+                            while (cursor.moveToNext()) {
+                                val id = cursor.getString(0) ?: continue
+                                val uri = android.provider.DocumentsContract
+                                    .buildDocumentUriUsingTree(treeUri, id)
+                                entries.add(mapOf(
+                                    "id" to id,
+                                    "uri" to uri.toString(),
+                                    "name" to (cursor.getString(1) ?: "Unnamed"),
+                                    "isDirectory" to (cursor.getString(2) == android.provider.DocumentsContract.Document.MIME_TYPE_DIR),
+                                    "size" to if (cursor.isNull(3)) 0L else cursor.getLong(3),
+                                    "modified" to if (cursor.isNull(4)) 0L else cursor.getLong(4),
+                                ))
+                            }
+                        }
+                        result.success(entries)
+                    } catch (error: Exception) {
+                        result.error("STORAGE_LIST_FAILED", error.message ?: "Could not read this folder.", null)
+                    }
+                    return@setMethodCallHandler
+                }
+                if (call.method == "deleteStorageDocument") {
+                    try {
+                        val uri = android.net.Uri.parse(call.argument<String>("uri")
+                            ?: throw IllegalArgumentException("File is missing."))
+                        result.success(android.provider.DocumentsContract.deleteDocument(contentResolver, uri))
+                    } catch (error: Exception) {
+                        result.error("STORAGE_DELETE_FAILED", error.message ?: "Could not delete this item.", null)
+                    }
+                    return@setMethodCallHandler
+                }
+                if (call.method == "openStorageDocument") {
+                    try {
+                        val uri = android.net.Uri.parse(call.argument<String>("uri")
+                            ?: throw IllegalArgumentException("File is missing."))
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, contentResolver.getType(uri) ?: "*/*")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        startActivity(intent)
+                        result.success(null)
+                    } catch (error: Exception) {
+                        result.error("STORAGE_OPEN_FAILED", error.message ?: "No app can open this file.", null)
+                    }
                     return@setMethodCallHandler
                 }
                 if (call.method == "startDirectGroup") {
@@ -163,6 +267,27 @@ class MainActivity : FlutterActivity() {
                     result.error("SECURE_STORE_FAILED", error.message ?: "Secure storage failed.", null)
                 }
             }
+    }
+
+    @Deprecated("Retained for the Android document tree picker callback")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != storagePickerRequest) return
+        val callback = pendingStoragePickerResult ?: return
+        pendingStoragePickerResult = null
+        val uri = if (resultCode == RESULT_OK) data?.data else null
+        if (uri == null) {
+            callback.success(null)
+            return
+        }
+        try {
+            val read = data?.flags?.and(Intent.FLAG_GRANT_READ_URI_PERMISSION) ?: 0
+            val write = data?.flags?.and(Intent.FLAG_GRANT_WRITE_URI_PERMISSION) ?: 0
+            contentResolver.takePersistableUriPermission(uri, read or write)
+            callback.success(uri.toString())
+        } catch (error: Exception) {
+            callback.error("STORAGE_PERMISSION_FAILED", error.message ?: "Could not keep access to this folder.", null)
+        }
     }
 
     @Suppress("DEPRECATION")

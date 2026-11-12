@@ -233,6 +233,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
   StreamSubscription<IncomingTransferProgress>? _transferProgressSubscription;
   StreamSubscription<IncomingChatMessage>? _chatSubscription;
   final Map<String, _TransferProgressItem> _incomingTransferProgress = {};
+  DateTime _lastNotificationUpdate = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -721,14 +722,12 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                 : 'Files will use the same local Wi-Fi network.',
             style: Theme.of(context).textTheme.bodySmall,
           ),
-          if (_incomingTransferProgress.values.any((item) => !item.complete))
-            _incomingProgressCards(),
           const SizedBox(height: 16),
           Expanded(
             child: Center(
               child: ConstrainedBox(
                 constraints:
-                    const BoxConstraints(maxWidth: 620, maxHeight: 620),
+                    const BoxConstraints(maxWidth: 760, maxHeight: 760),
                 child: AspectRatio(
                   aspectRatio: 1,
                   child: LayoutBuilder(
@@ -746,17 +745,6 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                             diameter: diameter,
                             color: colorScheme.primary,
                           ),
-                          for (final fraction in [.36, .66, .96])
-                            Container(
-                              width: diameter * fraction,
-                              height: diameter * fraction,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                    color: colorScheme.outlineVariant
-                                        .withValues(alpha: .35)),
-                              ),
-                            ),
                           Container(
                             width: 92,
                             height: 92,
@@ -954,57 +942,6 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                     icon: const Icon(Icons.add_circle_outline))
               ]))));
 
-  Widget _incomingProgressCards() {
-    final active = _incomingTransferProgress.values
-        .where((item) => !item.complete)
-        .toList(growable: false);
-    if (active.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(top: 10),
-      child: Column(children: [
-        for (final item in active.take(2))
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(children: [
-                      Icon(Icons.downloading,
-                          color: Theme.of(context).colorScheme.primary),
-                      const SizedBox(width: 10),
-                      Expanded(
-                          child: Text(
-                              item.failed
-                                  ? 'Transfer cancelled · ${item.fileName}'
-                                  : 'Receiving ${item.fileName} from ${item.deviceName}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis)),
-                      Text(_formatSpeed(item.bytesPerSecond)),
-                      if (!item.failed)
-                        IconButton(
-                            tooltip: 'Cancel incoming transfer',
-                            onPressed: () =>
-                                _discovery.cancelTransfer(item.transferId),
-                            icon: const Icon(Icons.close)),
-                    ]),
-                    const SizedBox(height: 5),
-                    LinearProgressIndicator(
-                        value: item.totalBytes == 0
-                            ? 1
-                            : item.bytesReceived / item.totalBytes,
-                        color: item.failed ? Colors.orangeAccent : null),
-                    const SizedBox(height: 4),
-                    Text(
-                        '${_formatBytes(item.bytesReceived)} of ${_formatBytes(item.totalBytes)}',
-                        style: Theme.of(context).textTheme.bodySmall),
-                  ]),
-            ),
-          ),
-      ]),
-    );
-  }
-
   void _updateTransferProgress(IncomingTransferProgress progress) {
     if (!mounted) return;
     final key = '${progress.transferId}:${progress.fileName}';
@@ -1017,6 +954,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
             deviceName: progress.deviceName,
             fileName: progress.fileName,
             totalBytes: progress.totalBytes));
+    item.isDirect = progress.isDirect;
     final elapsed = now.difference(item.lastUpdated).inMicroseconds / 1000000;
     final delta = progress.bytesReceived - item.bytesReceived;
     item.bytesReceived = progress.bytesReceived;
@@ -1025,6 +963,20 @@ class _OmniDropHomeState extends State<OmniDropHome> {
     final newlyCompleted = progress.complete && !item.complete;
     item.complete = progress.complete;
     item.failed = progress.failed;
+    _publishTransferNotification(
+      active: !progress.complete && !progress.failed,
+      title: progress.failed
+          ? 'Transfer interrupted'
+          : progress.complete
+              ? 'Transfer complete'
+              : 'Receiving ${progress.fileName}',
+      text: progress.complete || progress.failed
+          ? progress.deviceName
+          : '${_formatBytes(progress.bytesReceived)} of ${_formatBytes(progress.totalBytes)} · ${_estimateTime(progress.totalBytes - progress.bytesReceived, item.bytesPerSecond)}',
+      progress: progress.totalBytes == 0
+          ? (progress.complete ? 100 : 0)
+          : (100 * progress.bytesReceived / progress.totalBytes).round(),
+    );
     if (newlyCompleted) {
       unawaited(_storeTransferRecord({
         'id': '${now.microsecondsSinceEpoch}-${math.Random().nextInt(1 << 32)}',
@@ -1041,10 +993,56 @@ class _OmniDropHomeState extends State<OmniDropHome> {
     }
     if (progress.complete ||
         now.difference(item.lastUiUpdate) >=
-            const Duration(milliseconds: 200)) {
+            const Duration(milliseconds: 500)) {
       item.lastUiUpdate = now;
       setState(() {});
     }
+  }
+
+  void _publishTransferNotification({
+    required bool active,
+    required String title,
+    required String text,
+    required int progress,
+    bool force = false,
+  }) {
+    if (!Platform.isAndroid) return;
+    final now = DateTime.now();
+    if (active && !force &&
+        now.difference(_lastNotificationUpdate) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastNotificationUpdate = now;
+    unawaited(const MethodChannel('com.omnidrop/direct_radio')
+        .invokeMethod<void>('updateTransferNotification', {
+      'active': active,
+      'title': title,
+      'text': text,
+      'progress': progress.clamp(0, 100).toInt(),
+    }).catchError((_) {}));
+  }
+
+  String _estimateTime(int remainingBytes, double bytesPerSecond) {
+    if (remainingBytes <= 0) return 'Finishing…';
+    if (bytesPerSecond <= 0) return 'Estimating time…';
+    final duration = Duration(seconds: (remainingBytes / bytesPerSecond).ceil());
+    final finish = DateTime.now().add(duration);
+    return 'about ${_formatDuration(duration)} left · ${_formatTime(finish)} finish';
+  }
+
+  String _estimateOutgoingQueue() {
+    if (!_isSending) return '';
+    if (_currentBytesPerSecond <= 0) return 'Estimating remaining transfer time…';
+    var remainingBytes = 0;
+    final currentIndex = _queue.indexOf(_currentTransferFile ?? '');
+    for (var index = 0; index < _queueSizes.length; index++) {
+      if (index == currentIndex) {
+        remainingBytes += math.max(0, _currentFileTotalBytes - _currentFileBytesSent);
+      } else if (index > currentIndex || currentIndex < 0) {
+        remainingBytes += _queueSizes[index] ?? 0;
+      }
+    }
+    return _estimateTime(remainingBytes, _currentBytesPerSecond);
   }
 
   Widget _transfers() => switch (_transferView) {
@@ -1053,11 +1051,16 @@ class _OmniDropHomeState extends State<OmniDropHome> {
         _ => _queueTransfers(),
       };
 
-  Widget _queueTransfers() => Padding(
-      padding: const EdgeInsets.all(24),
+  Widget _queueTransfers() {
+    final compactLayout = MediaQuery.sizeOf(context).width < 760;
+    final incomingItems = _incomingTransferProgress.values
+        .where((item) => item.isDirect == _usesDirectTransport)
+        .toList(growable: false);
+    return Padding(
+      padding: EdgeInsets.all(compactLayout ? 16 : 24),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const _Brand(),
-        const SizedBox(height: 36),
+        SizedBox(height: compactLayout ? 16 : 28),
         Row(children: [
           Expanded(
               child: Text('Transfer queue',
@@ -1089,7 +1092,14 @@ class _OmniDropHomeState extends State<OmniDropHome> {
           onSelectionChanged: (selection) => unawaited(_selectSendTransport(selection.first)),
         ),
         const SizedBox(height: 12),
-        if (_queue.isEmpty && _incomingTransferProgress.isEmpty)
+        if (_isSending)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text('Queue estimate · ${_estimateOutgoingQueue()}',
+                maxLines: 2, overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall),
+          ),
+        if (_queue.isEmpty && incomingItems.isEmpty)
           const Expanded(
               child: Center(
                   child: Text('Your transfers will appear here.',
@@ -1116,7 +1126,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                                 : Icons.sync
                             : Icons.insert_drive_file),
                         title: Text(name,
-                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                            maxLines: 2, overflow: TextOverflow.ellipsis),
                         subtitle: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             mainAxisSize: MainAxisSize.min,
@@ -1124,7 +1134,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                               Text(active
                                   ? _sendFailed || _isPaused
                                       ? '${_isPaused ? 'Paused' : 'Interrupted'} · ${_formatBytes(_currentFileBytesSent)} of ${_formatBytes(_currentFileTotalBytes)} · Tap to resume'
-                                      : 'Sending · ${(_currentFileProgress * 100).round()}% · ${_formatBytes(_currentFileTotalBytes)}'
+                                      : 'Sending · ${(_currentFileProgress * 100).round()}% · ${_formatBytes(_currentFileTotalBytes)} · ${_formatSpeed(_currentBytesPerSecond)} · ${_estimateTime(_currentFileTotalBytes - _currentFileBytesSent, _currentBytesPerSecond)}'
                                   : _isSending
                                       ? 'Queued · ${_formatBytes(_queueSizes[index] ?? 0)}'
                                       : 'Ready · ${_formatBytes(_queueSizes[index] ?? 0)}'),
@@ -1134,28 +1144,29 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                                   color:
                                       _sendFailed ? Colors.orangeAccent : null),
                             ]),
-                        trailing: active && _isSending
-                            ? Row(mainAxisSize: MainAxisSize.min, children: [
-                                Text(_formatSpeed(_currentBytesPerSecond)),
-                                IconButton(
-                                    tooltip: 'Pause transfer',
-                                    onPressed: _pauseActiveTransfer,
-                                    icon: const Icon(Icons.pause_circle_outline)),
-                                IconButton(
-                                    tooltip: 'Cancel transfer',
-                                    onPressed: _cancelActiveTransfer,
-                                    icon: const Icon(Icons.close)),
-                              ])
-                            : Text(active
-                                ? _sendFailed
-                                    ? 'Retry'
-                                    : _isPaused
-                                        ? 'Resume'
-                                        : _formatSpeed(_currentBytesPerSecond)
-                                : 'Queued')));
+                        trailing: PopupMenuButton<String>(
+                          tooltip: 'Transfer actions',
+                          onSelected: (action) {
+                            if (action == 'pause') _pauseActiveTransfer();
+                            if (action == 'cancel') _cancelActiveTransfer();
+                            if (action == 'resume' && retryPeer != null) {
+                              unawaited(_sendSelected(retryPeer));
+                            }
+                            if (action == 'remove') _removeOutgoingQueueItem(index);
+                          },
+                          itemBuilder: (context) => [
+                            if (_isSending && active)
+                              const PopupMenuItem(value: 'pause', child: Text('Pause')),
+                            if (_isSending && active)
+                              const PopupMenuItem(value: 'cancel', child: Text('Cancel transfer')),
+                            if (!_isSending && active && (_isPaused || _sendFailed))
+                              PopupMenuItem(value: 'resume', child: Text(_isPaused ? 'Resume' : 'Retry')),
+                            if (!_isSending)
+                              const PopupMenuItem(value: 'remove', child: Text('Remove from queue')),
+                          ],
+                        )));
               }),
-            for (final item
-                in _incomingTransferProgress.values.toList().reversed)
+            for (final item in incomingItems.reversed)
               Card(
                 child: ListTile(
                   leading: Icon(item.complete
@@ -1164,7 +1175,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                           ? Icons.error_outline
                           : Icons.downloading),
                   title: Text(item.fileName,
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                      maxLines: 2, overflow: TextOverflow.ellipsis),
                   subtitle: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
@@ -1173,7 +1184,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                             ? 'Received · ${_formatBytes(item.totalBytes)}'
                             : item.failed
                                 ? 'Interrupted · ${_formatBytes(item.bytesReceived)} of ${_formatBytes(item.totalBytes)} · Resume from sender'
-                                : 'Receiving from ${item.deviceName} · ${_formatBytes(item.bytesReceived)} of ${_formatBytes(item.totalBytes)}'),
+                                : 'Receiving from ${item.deviceName} · ${_formatBytes(item.bytesReceived)} of ${_formatBytes(item.totalBytes)} · ${_formatSpeed(item.bytesPerSecond)} · ${_estimateTime(item.totalBytes - item.bytesReceived, item.bytesPerSecond)}'),
                         const SizedBox(height: 5),
                         LinearProgressIndicator(
                             value: item.totalBytes == 0
@@ -1181,16 +1192,21 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                                 : item.bytesReceived / item.totalBytes,
                             color: item.failed ? Colors.orangeAccent : null),
                       ]),
-                  trailing: item.complete || item.failed
-                      ? Text(item.complete ? 'Done' : 'Interrupted')
-                      : Row(mainAxisSize: MainAxisSize.min, children: [
-                          Text(_formatSpeed(item.bytesPerSecond)),
-                          IconButton(
-                              tooltip: 'Cancel incoming transfer',
-                              onPressed: () =>
-                                  _discovery.cancelTransfer(item.transferId),
-                              icon: const Icon(Icons.close)),
-                        ]),
+                  trailing: PopupMenuButton<String>(
+                    tooltip: 'Transfer actions',
+                    onSelected: (action) {
+                      if (action == 'cancel') _discovery.cancelTransfer(item.transferId);
+                      if (action == 'remove') {
+                        setState(() => _incomingTransferProgress.removeWhere((_, value) => identical(value, item)));
+                      }
+                    },
+                    itemBuilder: (context) => [
+                      if (!item.complete && !item.failed)
+                        const PopupMenuItem(value: 'cancel', child: Text('Cancel transfer')),
+                      if (item.complete || item.failed)
+                        const PopupMenuItem(value: 'remove', child: Text('Remove from queue')),
+                    ],
+                  ),
                 ),
               ),
           ])),
@@ -1202,6 +1218,22 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                         ? 'Searching local network'
                         : 'Listening for OmniDrop'))
       ]));
+  }
+
+  void _removeOutgoingQueueItem(int index) {
+    if (_isSending || index < 0 || index >= _queue.length) return;
+    setState(() {
+      _queue.removeAt(index);
+      _queueSizes.removeAt(index);
+      _sharedFiles.removeAt(index);
+      if (_queue.isEmpty) {
+        _selectedPeerId = null;
+        _retryTransferId = null;
+        _isPaused = false;
+        _sendFailed = false;
+      }
+    });
+  }
 
   Widget _records() {
     final sortedRecords = [..._transferRecords]..sort((a, b) =>
@@ -2629,6 +2661,13 @@ class _OmniDropHomeState extends State<OmniDropHome> {
       _lastProgressBytes = 0;
       _activeOutgoingTransferId = transferId;
     });
+    _publishTransferNotification(
+      active: true,
+      title: 'Sending files to ${peer.name}',
+      text: '${filesBeingSent.length} file${filesBeingSent.length == 1 ? '' : 's'} · preparing transfer',
+      progress: 0,
+      force: true,
+    );
     try {
       await _discovery.sendTrustedFiles(peer, filesBeingSent,
           transferId: transferId,
@@ -2638,7 +2677,7 @@ class _OmniDropHomeState extends State<OmniDropHome> {
         if (sent < total &&
             !newFile &&
             now.difference(_lastProgressUpdate) <
-                const Duration(milliseconds: 200)) {
+                const Duration(milliseconds: 400)) {
           return;
         }
         final elapsedSeconds = newFile
@@ -2657,6 +2696,12 @@ class _OmniDropHomeState extends State<OmniDropHome> {
                 elapsedSeconds <= 0 ? 0 : bytesDelta / elapsedSeconds;
           });
         }
+        _publishTransferNotification(
+          active: true,
+          title: 'Sending $fileName to ${peer.name}',
+          text: '${_formatBytes(sent)} of ${_formatBytes(total)} · ${_formatSpeed(_currentBytesPerSecond)} · ${_estimateTime(total - sent, _currentBytesPerSecond)}',
+          progress: total == 0 ? 100 : (sent * 100 / total).round(),
+        );
       });
       final completedAt = DateTime.now();
       for (final file in filesBeingSent) {
@@ -2676,6 +2721,13 @@ class _OmniDropHomeState extends State<OmniDropHome> {
         });
       }
       if (!mounted) return;
+      _publishTransferNotification(
+        active: false,
+        title: 'Transfer complete',
+        text: 'Files sent to ${peer.name}.',
+        progress: 100,
+        force: true,
+      );
       setState(() {
         _isSending = false;
         _activeOutgoingTransferId = null;
@@ -2698,6 +2750,13 @@ class _OmniDropHomeState extends State<OmniDropHome> {
     } catch (error) {
       if (mounted) {
         if (_pauseRequested || error is TransferPausedException) {
+          _publishTransferNotification(
+            active: false,
+            title: 'Transfer paused',
+            text: 'Paused at ${_formatBytes(_currentFileBytesSent)}. Resume in OmniDrop.',
+            progress: (_currentFileProgress * 100).round(),
+            force: true,
+          );
           setState(() {
             _isSending = false;
             _pauseRequested = false;
@@ -2712,6 +2771,13 @@ class _OmniDropHomeState extends State<OmniDropHome> {
           return;
         }
         if (_cancelRequested || error is TransferCancelledException) {
+          _publishTransferNotification(
+            active: false,
+            title: 'Transfer cancelled',
+            text: 'The transfer was stopped.',
+            progress: (_currentFileProgress * 100).round(),
+            force: true,
+          );
           final cancelledByReceiver = error is TransferCancelledException;
           setState(() {
             _isSending = false;
@@ -2743,6 +2809,13 @@ class _OmniDropHomeState extends State<OmniDropHome> {
           _currentTransferFile ??= _queue.firstOrNull;
           _currentBytesPerSecond = 0;
         });
+        _publishTransferNotification(
+          active: false,
+          title: 'Transfer interrupted',
+          text: 'Open OmniDrop to retry sending to ${peer.name}.',
+          progress: (_currentFileProgress * 100).round(),
+          force: true,
+        );
       }
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -2908,7 +2981,7 @@ class _RadarPulseState extends State<_RadarPulse>
 
   Widget _pulse(int index) {
     final progress = (_controller.value + index / 3) % 1;
-    final maxDiameter = math.max(150.0, widget.diameter * .62);
+    final maxDiameter = math.max(150.0, widget.diameter * .78);
     final diameter = 100 + (maxDiameter - 100) * progress;
     final opacity = (1 - progress) * .20;
     return Container(
@@ -3049,6 +3122,7 @@ class _TransferProgressItem {
   DateTime lastUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
   bool complete = false;
   bool failed = false;
+  bool isDirect = false;
 }
 
 class _OutgoingQueueSnapshot {
@@ -3111,6 +3185,10 @@ class _FileExplorerState extends State<_FileExplorer> {
   late Directory? _root;
   late Directory? _current;
   late Future<List<FileSystemEntity>> _listing;
+  String? _androidTreeUri;
+  final List<String?> _androidDocumentStack = <String?>[null];
+  final List<String> _androidPathLabels = <String>['Selected storage'];
+  late Future<List<Map<String, dynamic>>> _androidListing;
 
   @override
   void initState() {
@@ -3118,6 +3196,7 @@ class _FileExplorerState extends State<_FileExplorer> {
     _root = widget.rootPath == null ? null : Directory(widget.rootPath!);
     _current = _root;
     _listing = _readListing();
+    _androidListing = Future.value(const <Map<String, dynamic>>[]);
   }
 
   @override
@@ -3157,7 +3236,164 @@ class _FileExplorerState extends State<_FileExplorer> {
     return entries;
   }
 
-  void _refresh() => setState(() => _listing = _readListing());
+  void _refresh() => setState(() {
+        _listing = _readListing();
+        if (_androidTreeUri != null) _androidListing = _readAndroidListing();
+      });
+
+  Future<void> _chooseAnotherFolder() async {
+    if (Platform.isAndroid) {
+      try {
+        final uri = await const MethodChannel('com.omnidrop/direct_radio')
+            .invokeMethod<String>('pickStorageDirectory');
+        if (uri == null || !mounted) return;
+        setState(() {
+          _androidTreeUri = uri;
+          _androidDocumentStack
+            ..clear()
+            ..add(null);
+          _androidPathLabels
+            ..clear()
+            ..add('Selected storage');
+          _androidListing = _readAndroidListing();
+        });
+      } on PlatformException catch (error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(error.message ?? 'Could not open storage picker.')));
+        }
+      }
+      return;
+    }
+    try {
+      final path = await FilePicker.getDirectoryPath(
+          dialogTitle: 'Choose a folder to browse');
+      if (path != null && mounted) {
+        setState(() {
+          _root = Directory(path);
+          _current = _root;
+          _listing = _readListing();
+        });
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Could not open this folder: $error')));
+      }
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _readAndroidListing() async {
+    final treeUri = _androidTreeUri;
+    if (treeUri == null) return const [];
+    final entries = await const MethodChannel('com.omnidrop/direct_radio')
+        .invokeListMethod<Map<dynamic, dynamic>>('listStorageDirectory', {
+      'treeUri': treeUri,
+      if (_androidDocumentStack.last != null)
+        'documentId': _androidDocumentStack.last,
+    });
+    final result = (entries ?? const <Map<dynamic, dynamic>>[])
+        .map((entry) => Map<String, dynamic>.from(entry))
+        .where((entry) => widget.showHidden ||
+            !(entry['name'] as String).startsWith('.'))
+        .toList();
+    result.sort((a, b) {
+      final aDirectory = a['isDirectory'] == true;
+      final bDirectory = b['isDirectory'] == true;
+      if (aDirectory != bDirectory) return aDirectory ? -1 : 1;
+      final order = widget.sortByDate
+          ? (a['modified'] as int).compareTo(b['modified'] as int)
+          : (a['name'] as String)
+              .toLowerCase()
+              .compareTo((b['name'] as String).toLowerCase());
+      return widget.descending ? -order : order;
+    });
+    return result;
+  }
+
+  Future<void> _deleteAndroidEntry(Map<String, dynamic> entry) async {
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+              title: const Text('Delete this item?'),
+              content: Text('“${entry['name']}” will be deleted from this device.'),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+                FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
+              ],
+            ));
+    if (confirmed != true) return;
+    try {
+      await const MethodChannel('com.omnidrop/direct_radio').invokeMethod<bool>(
+          'deleteStorageDocument', {'uri': entry['uri']});
+      _refresh();
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(error.message ?? 'Could not delete this item.')));
+      }
+    }
+  }
+
+  Future<void> _openAndroidEntry(Map<String, dynamic> entry) async {
+    if (entry['isDirectory'] == true) {
+      setState(() {
+        _androidDocumentStack.add(entry['id'] as String);
+        _androidPathLabels.add(entry['name'] as String);
+        _androidListing = _readAndroidListing();
+      });
+      return;
+    }
+    try {
+      await const MethodChannel('com.omnidrop/direct_radio').invokeMethod<void>(
+          'openStorageDocument', {'uri': entry['uri']});
+    } on PlatformException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(error.message ?? 'Could not open this file.')));
+      }
+    }
+  }
+
+  Widget _androidStorageContents() => FutureBuilder<List<Map<String, dynamic>>>(
+        future: _androidListing,
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+                child: Text('Cannot open this folder. Access may have changed.\n${snapshot.error}',
+                    textAlign: TextAlign.center));
+          }
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final entries = snapshot.data!;
+          if (entries.isEmpty) return const Center(child: Text('This folder is empty.'));
+          return ListView.builder(
+            itemCount: entries.length,
+            itemBuilder: (context, index) {
+              final entry = entries[index];
+              final isDirectory = entry['isDirectory'] == true;
+              final size = entry['size'] as int? ?? 0;
+              return ListTile(
+                leading: Icon(isDirectory ? Icons.folder : Icons.insert_drive_file),
+                title: Text(entry['name'] as String,
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(isDirectory ? 'Folder' : _formatFileSize(size)),
+                onTap: () => _openAndroidEntry(entry),
+                trailing: PopupMenuButton<String>(
+                  tooltip: 'File actions',
+                  onSelected: (action) {
+                    if (action == 'delete') _deleteAndroidEntry(entry);
+                  },
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(value: 'delete', child: Text('Delete')),
+                  ],
+                ),
+              );
+            },
+          );
+        },
+      );
 
   Future<void> _delete(FileSystemEntity entity) async {
     final name = entity.uri.pathSegments.where((part) => part.isNotEmpty).last;
@@ -3232,17 +3468,36 @@ class _FileExplorerState extends State<_FileExplorer> {
                 child: Text('File explorer',
                     style: Theme.of(context).textTheme.headlineSmall)),
             IconButton(
+                tooltip: Platform.isAndroid
+                    ? 'Choose internal or external storage'
+                    : 'Choose another folder',
+                onPressed: _chooseAnotherFolder,
+                icon: const Icon(Icons.folder_open)),
+            IconButton(
                 tooltip: 'Refresh',
                 onPressed: _refresh,
                 icon: const Icon(Icons.refresh))
           ]),
-          if (_current != null)
-            Text(_current!.path,
+          if (_androidTreeUri != null || _current != null)
+            Text(_androidTreeUri != null
+                    ? (_androidDocumentStack.length == 1
+                        ? 'Selected internal or external storage'
+                        : _androidPathLabels.last)
+                    : _current!.path,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.bodySmall),
           Wrap(spacing: 6, children: [
-            if (_current != null &&
+            if (_androidTreeUri != null && _androidDocumentStack.length > 1)
+              TextButton.icon(
+                  onPressed: () => setState(() {
+                        _androidDocumentStack.removeLast();
+                        _androidPathLabels.removeLast();
+                        _androidListing = _readAndroidListing();
+                      }),
+                  icon: const Icon(Icons.arrow_upward),
+                  label: const Text('Up')),
+            if (_androidTreeUri == null && _current != null &&
                 _root != null &&
                 _current!.path != _root!.path)
               TextButton.icon(
@@ -3275,25 +3530,16 @@ class _FileExplorerState extends State<_FileExplorer> {
                   label: Text(widget.clipboardIsCut ? 'Move here' : 'Paste')),
           ]),
           Expanded(
-              child: _current == null
+              child: _androidTreeUri != null
+                  ? _androidStorageContents()
+                  : _current == null
                   ? Center(
                       child: Column(mainAxisSize: MainAxisSize.min, children: [
                       const Text(
                           'Choose a download folder to browse its files.'),
                       const SizedBox(height: 8),
                       FilledButton.icon(
-                          onPressed: () async {
-                            await FilePicker.getDirectoryPath(
-                                    dialogTitle: 'Choose folder to browse')
-                                .then((path) {
-                              if (path != null && mounted)
-                                setState(() {
-                                  _root = Directory(path);
-                                  _current = _root;
-                                  _listing = _readListing();
-                                });
-                            });
-                          },
+                          onPressed: _chooseAnotherFolder,
                           icon: const Icon(Icons.folder_open),
                           label: const Text('Choose folder'))
                     ]))
